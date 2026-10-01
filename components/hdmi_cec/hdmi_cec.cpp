@@ -369,6 +369,12 @@ SendResult HDMICEC::send_frame_(const Frame &frame, bool is_broadcast) {
 }
 
 bool HDMICEC::send_start_bit_() {
+  // Masked for the whole start bit. The busy-waits below run in an ordinary task, so any
+  // higher-priority task or interrupt on this core stretches the low phase; a few hundred
+  // microseconds is enough to break the 3.9 ms / 4.7 ms limits, and strict receivers (LG)
+  // then drop the frame without acknowledging it. Same pattern as the receive-side ack.
+  InterruptLock interrupt_lock;
+
   // 1. pull low for 3700 us
   set_pin_output_low();
   delay_microseconds_safe(3700);
@@ -398,6 +404,8 @@ void HDMICEC::send_bit_(bool bit_value) {
   const uint32_t low_duration_us = (bit_value ? HIGH_BIT_US : LOW_BIT_US);
   const uint32_t high_duration_us = (TOTAL_BIT_US - low_duration_us);
 
+  // One bit (2.4 ms) at a time, so pending interrupts still get serviced between bits.
+  InterruptLock interrupt_lock;
   set_pin_output_low();
   delay_microseconds_safe(low_duration_us);
   set_pin_input_high();
@@ -405,6 +413,8 @@ void HDMICEC::send_bit_(bool bit_value) {
 }
 
 bool HDMICEC::send_high_and_test_() {
+  // Masked so the low phase stays 600 us and the sample lands inside the safe window.
+  InterruptLock interrupt_lock;
   uint32_t start_us = micros();
 
   // send a Logical 1
