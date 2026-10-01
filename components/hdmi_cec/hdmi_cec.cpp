@@ -132,7 +132,13 @@ void HDMICEC::loop() {
       );
       if (can_trigger) {
         trigger->trigger(src_addr, dest_addr, data);
-        handled_by_trigger = true;
+        // Only a trigger that names the message (by opcode or exact data) takes it over from
+        // the built-in handlers. A catch-all trigger -- logging, forwarding to Home Assistant --
+        // would otherwise silently disable every built-in reply, including Report Physical
+        // Address and Feature Abort, and the device stops behaving like a CEC device.
+        if (trigger->opcode_.has_value() || trigger->data_.has_value()) {
+          handled_by_trigger = true;
+        }
       }
     }
 
