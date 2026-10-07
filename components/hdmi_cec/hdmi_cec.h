@@ -101,7 +101,9 @@ public:
   bool send(uint8_t source, uint8_t destination, const std::vector<uint8_t> &data_bytes);
 
   // Component overrides
-  float get_setup_priority() { return esphome::setup_priority::HARDWARE; }
+  // `const override`: without it this never overrode Component's method, and the component
+  // was set up at the default (late) priority, after switches and other HARDWARE users.
+  float get_setup_priority() const override { return esphome::setup_priority::HARDWARE; }
   void setup() override;
   void dump_config() override;
   void loop() override;
@@ -124,6 +126,7 @@ protected:
   uint16_t physical_address_;
   bool promiscuous_mode_;
   bool monitor_mode_;
+  bool setup_done_{false};  // nothing may be sent before setup() has prepared the pin
   std::vector<uint8_t> osd_name_bytes_;
   std::vector<MessageTrigger*> message_triggers_;
 

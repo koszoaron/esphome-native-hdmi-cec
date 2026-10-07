@@ -112,6 +112,7 @@ void HDMICEC::setup() {
   frames_queue_.reset();
   pin_->attach_interrupt(HDMICEC::gpio_intr_, this, gpio::INTERRUPT_ANY_EDGE);
   set_pin_input_high();
+  setup_done_ = true;
 }
 
 void HDMICEC::dump_config() {
@@ -274,6 +275,12 @@ void HDMICEC::try_builtin_handler_(uint8_t source, uint8_t destination, const st
 
 bool HDMICEC::send(uint8_t source, uint8_t destination, const std::vector<uint8_t> &data_bytes) {
   if (monitor_mode_) return false;
+  if (!setup_done_) {
+    // Another component can call send() from its own setup() -- a template switch restoring
+    // its state, for instance. The pin is not ready yet; driving it would crash.
+    ESP_LOGW(TAG, "HDMICEC::send(): called before setup, frame dropped");
+    return false;
+  }
 
   bool is_broadcast = (destination == 0xF);
 
