@@ -28,8 +28,16 @@ static const size_t MAX_ATTEMPTS = 5;
 // context-switch overhead from yielding on every microsecond-scale iteration.
 static const uint32_t YIELD_INTERVAL_US = 1000;
 
+#ifdef USE_ESP32
+// On the ESP32 the pin stays in one mode for good: an open-drain output that is also readable.
+// Driving the bus is then a single register write (0 = pull low, 1 = release), instead of two
+// driver calls per edge that run from flash and take hundreds of microseconds when cold.
+static const gpio::Flags BUS_MODE_FLAGS =
+    gpio::FLAG_INPUT | gpio::FLAG_OUTPUT | gpio::FLAG_OPEN_DRAIN | gpio::FLAG_PULLUP;
+#else
 static const gpio::Flags INPUT_MODE_FLAGS = gpio::FLAG_INPUT | gpio::FLAG_PULLUP;
 static const gpio::Flags OUTPUT_MODE_FLAGS = gpio::FLAG_OUTPUT | gpio::FLAG_OPEN_DRAIN;
+#endif
 // Note: the esp8266 does NOT support 'FLAG_OUTPUT | FLAG_OPEN_DRAIN | FLAG_PULLUP' as opposed to the esp32 and rp2040.
 // (see 'flags_to_mode' in its esphome gpio.cpp).
 // So, unfortunately, in 'OPEN_DRAIN' mode, the required 'PULLUP' cannot be activated.
@@ -64,17 +72,43 @@ std::string Frame::to_string(bool skip_decode) const {
 }
 
 inline void IRAM_ATTR HDMICEC::set_pin_input_high() {
+#ifdef USE_ESP32
+  isr_pin_.digital_write(true);
+#else
   pin_->pin_mode(INPUT_MODE_FLAGS);
+#endif
 }
 
 inline void IRAM_ATTR HDMICEC::set_pin_output_low() {
+#ifdef USE_ESP32
+  isr_pin_.digital_write(false);
+#else
   pin_->pin_mode(OUTPUT_MODE_FLAGS);
   pin_->digital_write(false);
+#endif
+}
+
+// Busy-waits until `offset_us` after `start_us`. Waiting for a point in time rather than for a
+// duration keeps whatever the surrounding code costs out of the bit timing, and never
+// underflows when that point has already passed.
+static inline void wait_until_(uint32_t start_us, uint32_t offset_us) {
+  const uint32_t elapsed_us = micros() - start_us;
+  if (elapsed_us < offset_us) {
+    delay_microseconds_safe(offset_us - elapsed_us);
+  }
 }
 
 void HDMICEC::setup() {
-  this->pin_->setup();  
+#ifdef USE_ESP32
+  // Output latch high before the pin is configured, so it never pulls the bus low on the way.
+  pin_->digital_write(true);
+  pin_->setup();
+  pin_->pin_mode(BUS_MODE_FLAGS);
   isr_pin_ = pin_->to_isr();
+#else
+  this->pin_->setup();
+  isr_pin_ = pin_->to_isr();
+#endif
   frames_queue_.reset();
   pin_->attach_interrupt(HDMICEC::gpio_intr_, this, gpio::INTERRUPT_ANY_EDGE);
   set_pin_input_high();
@@ -381,19 +415,21 @@ bool HDMICEC::send_start_bit_() {
   // then drop the frame without acknowledging it. Same pattern as the receive-side ack.
   InterruptLock interrupt_lock;
 
+  // All waits below are measured from the falling edge, not from each other.
   // 1. pull low for 3700 us
   set_pin_output_low();
-  delay_microseconds_safe(3700);
+  const uint32_t start_us = micros();
+  wait_until_(start_us, 3700);
 
   // 2. pull high for 800 us
   set_pin_input_high();
-  delay_microseconds_safe(400);
+  wait_until_(start_us, 4100);
 
   // check half-way the 'high' interval for no collision
   bool value = pin_->digital_read();
 
   // check at end of 'high' interval for no collision
-  delay_microseconds_safe(400);
+  wait_until_(start_us, 4500);
   value &= pin_->digital_read();
 
   // total duration of start bit: 4500 us
@@ -408,41 +444,33 @@ void HDMICEC::send_bit_(bool bit_value) {
   // logic 0: pull low for 1500 us, then pull high for 900 us
 
   const uint32_t low_duration_us = (bit_value ? HIGH_BIT_US : LOW_BIT_US);
-  const uint32_t high_duration_us = (TOTAL_BIT_US - low_duration_us);
 
   // One bit (2.4 ms) at a time, so pending interrupts still get serviced between bits.
   InterruptLock interrupt_lock;
   set_pin_output_low();
-  delay_microseconds_safe(low_duration_us);
+  const uint32_t start_us = micros();
+  wait_until_(start_us, low_duration_us);
   set_pin_input_high();
-  delay_microseconds_safe(high_duration_us);
+  wait_until_(start_us, TOTAL_BIT_US);
 }
 
 bool HDMICEC::send_high_and_test_() {
   // Masked so the low phase stays 600 us and the sample lands inside the safe window.
   InterruptLock interrupt_lock;
-  uint32_t start_us = micros();
 
   // send a Logical 1
   set_pin_output_low();
-  delay_microseconds_safe(HIGH_BIT_US);
+  const uint32_t start_us = micros();
+  wait_until_(start_us, HIGH_BIT_US);
   set_pin_input_high();
 
   // ...then wait up to the middle of the "Safe sample period" (CEC spec -> Signaling and Bit Timing -> Figure 5)
-  //
-  // Both waits are clamped: the subtraction is unsigned, so once the deadline has already
-  // passed it underflows to nearly 2^32 us. delay_microseconds_safe() routes anything above
-  // 5 ms through vTaskDelay(), so the caller would sleep for ~71 minutes.
   static const uint32_t SAFE_SAMPLE_US = 1050;
-  uint32_t elapsed_us = micros() - start_us;
-  if (elapsed_us < SAFE_SAMPLE_US)
-    delay_microseconds_safe(SAFE_SAMPLE_US - elapsed_us);
+  wait_until_(start_us, SAFE_SAMPLE_US);
   bool value = pin_->digital_read();
 
   // sleep for the rest of the bit period
-  elapsed_us = micros() - start_us;
-  if (elapsed_us < TOTAL_BIT_US)
-    delay_microseconds_safe(TOTAL_BIT_US - elapsed_us);
+  wait_until_(start_us, TOTAL_BIT_US);
 
   // If a 'high' value was read, the 'low' pulse was short, not lengthened by another driver.
   // Such short pulse represents a 'high' bit.
